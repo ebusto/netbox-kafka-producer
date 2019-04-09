@@ -59,7 +59,6 @@ class KafkaChangeMiddleware:
 			signal.connect(receiver, dispatch_uid=__name__)
 
 		self.encoder = json.DjangoJSONEncoder()
-		self.ignore  = ('CustomFieldValue', 'ObjectChange', 'TaggedItem')
 		self.logger  = logging.getLogger(__name__)
 
 		self.servers = settings.KAFKA['SERVERS']
@@ -69,6 +68,9 @@ class KafkaChangeMiddleware:
 			'bootstrap.servers':       self.servers,
 			'socket.keepalive.enable': True,
 		})
+
+		# Ignore signal senders that provide duplicate information.
+		self.ignore  = ('CustomFieldValue', 'ObjectChange', 'TaggedItem')
 
 	def __call__(self, request):
 		_thread_locals.events = collections.defaultdict(list)
@@ -105,34 +107,42 @@ class KafkaChangeMiddleware:
 				})
 
 		if messages:
-			common = {
-				'@timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-			}
-
-			# If we're behind a proxy, get the client's IP address.
-			if 'HTTP_X_FORWARDED_FOR' in request.META:
-				request.META['REMOTE_ADDR'] = request.META['HTTP_X_FORWARDED_FOR']
-
-			# The REMOTE_HOST header is unreliable, so perform a DNS lookup of the IP.
-			try:
-				request.META['REMOTE_HOST'] = socket.gethostbyaddr(request.META['REMOTE_ADDR'])[0]
-			except:
-				request.META['REMOTE_HOST'] = None
-
-			common['request'] = {
-				'addr': request.META['REMOTE_ADDR'],
-				'host': request.META['REMOTE_HOST'],
-				'id':   uuid.uuid4().hex,
-				'user': request.user.get_username(),
-			}
-
-			common['response'] = {
-				'host': socket.gethostname(),
-			}
-
-			self.publish(messages, common)
+			self.publish(messages, self.common(request))
 
 		return response
+
+	def common(self, request):
+		addr = request.META['REMOTE_ADDR'],
+		host = request.META['REMOTE_HOST'],
+		user = request.user.get_username()
+
+		# If we're behind a proxy, get the client's IP address.
+		if 'HTTP_X_FORWARDED_FOR' in request.META:
+			addr = request.META['HTTP_X_FORWARDED_FOR']
+
+		if isinstance(addr, tuple):
+			addr = addr[0]
+
+		# The REMOTE_HOST header is unreliable, so perform a DNS lookup of the IP.
+		try:
+			host = socket.gethostbyaddr(addr)[0]
+		except:
+			pass
+
+		timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+		return {
+			'@timestamp': timestamp,
+			'request': {
+				'addr': addr,
+				'host': host,
+				'id':   uuid.uuid4().hex,
+				'user': user,
+			},
+			'response': {
+				'host': socket.gethostname(),
+			},
+		}
 
 	def publish(self, messages, common):
 		for message in messages:
