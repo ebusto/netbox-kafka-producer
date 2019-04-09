@@ -6,10 +6,11 @@ import socket
 import threading
 import uuid
 
-from datetime                import datetime
 from django.conf             import settings
 from django.core.serializers import json
 from django.db.models        import signals
+
+from time import gmtime, strftime
 
 from utilities.api import get_serializer_for_model
 
@@ -113,7 +114,6 @@ class KafkaChangeMiddleware:
 
 	def common(self, request):
 		addr = request.META['REMOTE_ADDR'],
-		host = request.META['REMOTE_HOST'],
 		user = request.user.get_username()
 
 		# If we're behind a proxy, get the client's IP address.
@@ -123,21 +123,14 @@ class KafkaChangeMiddleware:
 		if isinstance(addr, tuple):
 			addr = addr[0]
 
-		# The REMOTE_HOST header is unreliable, so perform a DNS lookup of the IP.
-		try:
-			host = socket.gethostbyaddr(addr)[0]
-		except:
-			pass
-
-		timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+		timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
 
 		return {
 			'@timestamp': timestamp,
 			'request': {
 				'addr': addr,
-				'host': host,
-				'id':   uuid.uuid4().hex,
 				'user': user,
+				'uuid': uuid.uuid4().hex,
 			},
 			'response': {
 				'host': socket.gethostname(),
