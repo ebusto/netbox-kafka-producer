@@ -1,0 +1,2 @@
+confluent-kafka==1.0.0
+dictdiffer==0.8.0

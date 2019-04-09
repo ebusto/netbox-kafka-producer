@@ -1,0 +1,5 @@
+*.pyc
+*.swp
+.pytest_cache
+.python-version
+__pycache__
