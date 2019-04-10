@@ -4,13 +4,12 @@ import dictdiffer
 import logging
 import socket
 import threading
+import time
 import uuid
 
 from django.conf             import settings
 from django.core.serializers import json
 from django.db.models        import signals
-
-from time import gmtime, strftime
 
 from utilities.api import get_serializer_for_model
 
@@ -21,30 +20,8 @@ class Record:
 		self.event    = event
 		self.sender   = sender
 		self.instance = instance
-		self._model   = None
 
-	@property
-	def model(self):
-		if not self._model:
-			self.serialize()
-
-		return self._model
-
-	def serialize(self):
-		if callable(self.instance):
-			self.instance = self.instance()
-
-		try:
-			serializer = get_serializer_for_model(self.instance)
-		except:
-			return None
-
-		self._model = serializer(self.instance, context={'request': None})
-		self._model = self._model.data
-
-		# Prevent dictdiffer from trying to recurse infinitely.
-		if 'tags' in self._model:
-			self._model['tags'] = [str(tag) for tag in self._model['tags']]
+		self.model = None
 
 class KafkaChangeMiddleware:
 	def __init__(self, get_response):
@@ -71,17 +48,21 @@ class KafkaChangeMiddleware:
 		})
 
 		# Ignore signal senders that provide duplicate information.
-		self.ignore  = ('CustomFieldValue', 'ObjectChange', 'TaggedItem')
+		self.ignore = ('CustomFieldValue', 'ObjectChange', 'TaggedItem')
 
 	def __call__(self, request):
-		_thread_locals.events = collections.defaultdict(list)
+		_thread_locals.request = request
+		_thread_locals.streams = collections.defaultdict(list)
 
 		messages = []
 		response = self.get_response(request)
 
-		for stream in _thread_locals.events.values():
+		for stream in _thread_locals.streams.values():
 			head = stream[0]
 			tail = stream[-1]
+
+			if tail.model is None:
+				tail.model = self.serialize(tail.sender, tail.instance)
 
 			message = collections.defaultdict(dict)
 
@@ -92,6 +73,9 @@ class KafkaChangeMiddleware:
 			})
 
 			messages.append(message)
+
+			if head.event != 'update':
+				continue
 
 			for change in dictdiffer.diff(head.model, tail.model, expand=True):
 				field = change[1]
@@ -113,18 +97,15 @@ class KafkaChangeMiddleware:
 		return response
 
 	def common(self, request):
-		addr = request.META['REMOTE_ADDR'],
+		addr = request.META['REMOTE_ADDR']
 		user = request.user.get_username()
 
 		# Handle being behind a proxy.
 		if 'HTTP_X_FORWARDED_FOR' in request.META:
 			addr = request.META['HTTP_X_FORWARDED_FOR'][0]
 
-		# Use the first address.
-		if isinstance(addr, (list, tuple)):
-			addr = addr[0]
-
-		timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
+		# RFC3339 timestamp.
+		timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 		return {
 			'@timestamp': timestamp,
@@ -146,34 +127,63 @@ class KafkaChangeMiddleware:
 
 		self.producer.flush()
 
-	def record(self, event, sender, instance, pk):
+	def record(self, event, sender, instance):
 		if sender.__name__ in self.ignore:
 			return
 
 		record = Record(event, sender, instance)
-		stream = str(sender) + str(pk)
+		stream = _thread_locals.streams[id(instance)]
 
-		# The first record must be serialized immediately in order to retrieve
-		# related records, such as custom fields, before they're modified.
-		if len(_thread_locals.events[stream]) == 0 and event != 'create':
-			record.serialize()
+		# The first record must be retrieved before related records are
+		# possibly updated.
+		if len(stream) == 0:
+			record.model = self.serialize(sender, instance)
 
-		# Only store the first and last records for this stream.
-		if len(_thread_locals.events[stream]) == 2:
-			_thread_locals.events[stream].pop()
+		# Store only the first and last records for each instance.
+		if len(stream) == 2:
+			stream.pop()
 
-		_thread_locals.events[stream].append(record)
+		stream.append(record)
+
+	def serialize(self, sender, instance):
+		# A new record that has not been written to the database.
+		if not instance.pk:
+			return {}
+
+		try:
+			serializer = get_serializer_for_model(instance)
+		except Exception as err:
+			self.logger.warn('get_serializer_for_model: {}'.format(err))
+
+			return {}
+
+		# The request is required for the URLs to be rendered correctly.
+		context = {'request': _thread_locals.request}
+
+		model = serializer(sender.objects.get(pk=instance.pk), context=context)
+		model = model.data
+
+		# Prevent dictdiffer from trying to recurse infinitely.
+		if 'tags' in model:
+			model['tags'] = list(model['tags'])
+
+		return model
 
 	def signal_post_save(self, sender, instance, created, **kwargs):
-		event = 'create' if created else 'update'
+		events = {
+			True:  'create',
+			False: 'update',
+		}
 
-		self.record(event, sender, lambda: sender.objects.get(pk=instance.id), instance.id)
+		self.record(events[created], sender, instance)
 
 	def signal_pre_delete(self, sender, instance, **kwargs):
-		self.record('delete', sender, instance, instance.id)
+		self.record('delete', sender, instance)
 
 	def signal_pre_save(self, sender, instance, **kwargs):
-		instance = sender.objects.filter(pk=instance.id).first()
+		events = {
+			True:  'update',
+			False: 'create',
+		}
 
-		if instance:
-			self.record('update', sender, instance, instance.id)
+		self.record(events[bool(instance.pk)], sender, instance)
