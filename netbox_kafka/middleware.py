@@ -1,7 +1,6 @@
 import collections
 import confluent_kafka
 import dictdiffer
-import logging
 import socket
 import threading
 import time
@@ -15,6 +14,8 @@ from utilities.api import get_serializer_for_model
 
 _thread_locals = threading.local()
 
+# Record is a simple container class for bundling signal information. The model
+# is the serialized (dict) version of the instance, generated when required.
 class Record:
 	def __init__(self, event, sender, instance):
 		self.event    = event
@@ -23,6 +24,10 @@ class Record:
 
 		self.model = None
 
+# Tracking changes is accomplished by observing signals emitted for models
+# created, updated, or deleted during a request. In order to determine the
+# difference between two models, the first and last instance are stored in
+# the per-instance "stream", partitioned by id(instance).
 class KafkaChangeMiddleware:
 	def __init__(self, get_response):
 		self.get_response = get_response
@@ -37,8 +42,6 @@ class KafkaChangeMiddleware:
 			signal.connect(receiver, dispatch_uid=__name__)
 
 		self.encoder = json.DjangoJSONEncoder()
-		self.logger  = logging.getLogger(__name__)
-
 		self.servers = settings.KAFKA['SERVERS']
 		self.topic   = settings.KAFKA['TOPIC']
 
@@ -57,10 +60,16 @@ class KafkaChangeMiddleware:
 		messages = []
 		response = self.get_response(request)
 
+		# streams = {
+		#   id(instance): [Record, Record, ...]
+		# }
 		for stream in _thread_locals.streams.values():
 			head = stream[0]
 			tail = stream[-1]
 
+			# Serializing the last instance is deferred to as late as possible,
+			# in order to capture all related changes, such as tag and custom
+			# field updates.
 			if tail.model is None:
 				tail.model = self.serialize(tail.sender, tail.instance)
 
@@ -74,6 +83,7 @@ class KafkaChangeMiddleware:
 
 			messages.append(message)
 
+			# No need to find differences unless an existing model was updated.
 			if head.event != 'update':
 				continue
 
@@ -96,6 +106,7 @@ class KafkaChangeMiddleware:
 
 		return response
 
+	# Common metadata from the request, to be included with each message.
 	def common(self, request):
 		addr = request.META['REMOTE_ADDR']
 		user = request.user.get_username()
@@ -127,6 +138,7 @@ class KafkaChangeMiddleware:
 
 		self.producer.flush()
 
+	# Event is create, update, or delete, as determined by the signal handler.
 	def record(self, event, sender, instance):
 		if sender.__name__ in self.ignore:
 			return
@@ -134,8 +146,8 @@ class KafkaChangeMiddleware:
 		record = Record(event, sender, instance)
 		stream = _thread_locals.streams[id(instance)]
 
-		# The first record must be retrieved before related records are
-		# possibly updated.
+		# The first instance must be serialized before related records are
+		# updated.
 		if len(stream) == 0:
 			record.model = self.serialize(sender, instance)
 
@@ -150,14 +162,13 @@ class KafkaChangeMiddleware:
 		if not instance.pk:
 			return {}
 
+		# Unserializable models are silently ignored.
 		try:
 			serializer = get_serializer_for_model(instance)
-		except Exception as err:
-			self.logger.warn('get_serializer_for_model: {}'.format(err))
-
+		except:
 			return {}
 
-		# The request is required for the URLs to be rendered correctly.
+		# The request is required for URLs to be rendered correctly.
 		context = {'request': _thread_locals.request}
 
 		model = serializer(sender.objects.get(pk=instance.pk), context=context)
