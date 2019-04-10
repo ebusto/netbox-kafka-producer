@@ -116,11 +116,12 @@ class KafkaChangeMiddleware:
 		addr = request.META['REMOTE_ADDR'],
 		user = request.user.get_username()
 
-		# If we're behind a proxy, get the client's IP address.
+		# Handle being behind a proxy.
 		if 'HTTP_X_FORWARDED_FOR' in request.META:
-			addr = request.META['HTTP_X_FORWARDED_FOR']
+			addr = request.META['HTTP_X_FORWARDED_FOR'][0]
 
-		if isinstance(addr, tuple):
+		# Use the first address.
+		if isinstance(addr, (list, tuple)):
 			addr = addr[0]
 
 		timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime())
@@ -145,9 +146,6 @@ class KafkaChangeMiddleware:
 
 		self.producer.flush()
 
-	# events = {
-	# 	'class:pk': [...],
-	# }
 	def record(self, event, sender, instance, pk):
 		if sender.__name__ in self.ignore:
 			return
