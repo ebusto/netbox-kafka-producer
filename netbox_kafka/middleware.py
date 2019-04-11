@@ -113,7 +113,7 @@ class KafkaChangeMiddleware:
 
 		# Handle being behind a proxy.
 		if 'HTTP_X_FORWARDED_FOR' in request.META:
-			addr = request.META['HTTP_X_FORWARDED_FOR'][0]
+			addr = request.META['HTTP_X_FORWARDED_FOR']
 
 		# RFC3339 timestamp.
 		timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
