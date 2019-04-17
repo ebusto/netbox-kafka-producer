@@ -50,8 +50,16 @@ class KafkaChangeMiddleware:
 			'socket.keepalive.enable': True,
 		})
 
-		# Ignore signal senders that provide duplicate information.
-		self.ignore = ('CustomFieldValue', 'ObjectChange', 'TaggedItem')
+		# Ignore senders that provide duplicate or uninteresting information.
+		self.ignore = (
+			'django.contrib.admin.models.LogEntry',
+			'django.contrib.auth.models.Group',
+			'django.contrib.auth.models.User',
+			'django.contrib.sessions.models.Session',
+			'extras.models.CustomFieldValue',
+			'extras.models.ObjectChange',
+			'taggit.models.TaggedItem',
+		)
 
 	def __call__(self, request):
 		_thread_locals.request = request
@@ -140,7 +148,7 @@ class KafkaChangeMiddleware:
 
 	# Event is create, update, or delete, as determined by the signal handler.
 	def record(self, event, sender, instance):
-		if sender.__name__ in self.ignore:
+		if str(sender) in self.ignore:
 			return
 
 		record = Record(event, sender, instance)
