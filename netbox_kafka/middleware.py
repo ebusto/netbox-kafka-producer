@@ -1,6 +1,7 @@
 import collections
 import confluent_kafka
 import dictdiffer
+import re
 import socket
 import threading
 import time
@@ -51,15 +52,12 @@ class KafkaChangeMiddleware:
 		})
 
 		# Ignore senders that provide duplicate or uninteresting information.
-		self.ignore = (
-			'django.contrib.admin.models.LogEntry',
-			'django.contrib.auth.models.Group',
-			'django.contrib.auth.models.User',
-			'django.contrib.sessions.models.Session',
+		self.ignore = list(map(lambda pattern: re.compile(pattern), [
+			'django.contrib',
 			'extras.models.CustomFieldValue',
 			'extras.models.ObjectChange',
-			'taggit.models.TaggedItem',
-		)
+			'taggit',
+		]))
 
 	def __call__(self, request):
 		_thread_locals.request = request
@@ -75,11 +73,16 @@ class KafkaChangeMiddleware:
 			head = stream[0]
 			tail = stream[-1]
 
-			# Serializing the last instance is deferred to as late as possible,
-			# in order to capture all related changes, such as tag and custom
-			# field updates.
+			# Loading and serializing the last instance is deferred to as late
+			# as possible, in order to capture all related changes, such as tag
+			# and custom field updates.
 			if tail.model is None:
-				tail.model = self.serialize(tail.sender, tail.instance)
+				tail.instance = tail.sender.objects.get(pk=tail.instance.pk)
+				tail.model    = self.serialize(tail.sender, tail.instance)
+
+			# Prevent dictdiffer from trying to recurse infinitely.
+			if 'tags' in tail.model:
+				tail.model['tags'] = list(tail.model['tags'])
 
 			message = collections.defaultdict(dict)
 
@@ -90,6 +93,14 @@ class KafkaChangeMiddleware:
 			})
 
 			messages.append(message)
+
+			# In order for the consumer to easily build a pynetbox record,
+			# include the absolute URL.
+			if head.event != 'delete':
+				nested = self.serialize(tail.sender, tail.instance, 'Nested')
+
+				if nested and 'url' in nested:
+					message['@url'] = nested['url']
 
 			# No need to find differences unless an existing model was updated.
 			if head.event != 'update':
@@ -148,7 +159,11 @@ class KafkaChangeMiddleware:
 
 	# Event is create, update, or delete, as determined by the signal handler.
 	def record(self, event, sender, instance):
-		if str(sender) in self.ignore:
+		# Determine the fully qualified sender name.
+		name = sender.__module__ + '.' + sender.__qualname__
+
+		# Ignore sender?
+		if any(map(lambda pattern: pattern.match(name), self.ignore)):
 			return
 
 		record = Record(event, sender, instance)
@@ -165,28 +180,18 @@ class KafkaChangeMiddleware:
 
 		stream.append(record)
 
-	def serialize(self, sender, instance):
+	def serialize(self, sender, instance, prefix=''):
 		# A new record that has not been written to the database.
 		if not instance.pk:
-			return {}
-
-		# Unserializable models are silently ignored.
-		try:
-			serializer = get_serializer_for_model(instance)
-		except:
-			return {}
+			return None
 
 		# The request is required for URLs to be rendered correctly.
-		context = {'request': _thread_locals.request}
+		serializer = get_serializer_for_model(instance, prefix)
+		serialized = serializer(instance, context={
+			'request': _thread_locals.request
+		})
 
-		model = serializer(sender.objects.get(pk=instance.pk), context=context)
-		model = model.data
-
-		# Prevent dictdiffer from trying to recurse infinitely.
-		if 'tags' in model:
-			model['tags'] = list(model['tags'])
-
-		return model
+		return serialized.data
 
 	def signal_post_save(self, sender, instance, created, **kwargs):
 		events = {
