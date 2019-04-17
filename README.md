@@ -5,11 +5,11 @@ This module provides middleware to publish [NetBox](https://github.com/digitaloc
 Add the following to your NetBox settings.
 ```
 INSTALLED_APPS += (
-	'netbox_kafka',
+	'netbox_kafka_producer',
 )
 
 MIDDLEWARE += (
-	'netbox_kafka.middleware.KafkaChangeMiddleware',
+	'netbox_kafka_producer.middleware.KafkaChangeMiddleware',
 )
 
 KAFKA = {
