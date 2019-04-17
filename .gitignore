@@ -3,3 +3,6 @@
 .pytest_cache
 .python-version
 __pycache__
+build
+dist
+netbox_kafka_producer.egg-info
