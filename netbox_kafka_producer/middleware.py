@@ -97,10 +97,13 @@ class KafkaChangeMiddleware:
 			# In order for the consumer to easily build a pynetbox record,
 			# include the absolute URL.
 			if head.event != 'delete':
-				nested = self.serialize(tail.sender, tail.instance, 'Nested')
+				try:
+					nested = self.serialize(tail.sender, tail.instance, 'Nested')
 
-				if nested and 'url' in nested:
-					message['@url'] = nested['url']
+					if nested and 'url' in nested:
+						message['@url'] = nested['url']
+				except:
+					pass
 
 			# No need to find differences unless an existing model was updated.
 			if head.event != 'update':
