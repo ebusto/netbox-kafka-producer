@@ -79,10 +79,6 @@ class KafkaChangeMiddleware:
 			if tail.model is None:
 				tail.model = self.serialize(tail.sender, tail.instance)
 
-			# Prevent dictdiffer from trying to recurse infinitely.
-			if 'tags' in tail.model:
-				tail.model['tags'] = list(tail.model['tags'])
-
 			message = collections.defaultdict(dict)
 
 			message.update({
@@ -194,7 +190,13 @@ class KafkaChangeMiddleware:
 		serializer = get_serializer_for_model(instance, prefix)
 		serialized = serializer(instance, context=context)
 
-		return serialized.data
+		model = serialized.data
+
+		# Prevent dictdiffer from trying to recurse infinitely.
+		if 'tags' in model:
+			model['tags'] = list(model['tags'])
+
+		return model
 
 	def signal_post_save(self, sender, instance, created, **kwargs):
 		events = {
