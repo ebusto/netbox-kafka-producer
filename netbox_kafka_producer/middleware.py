@@ -77,8 +77,7 @@ class KafkaChangeMiddleware:
 			# as possible, in order to capture all related changes, such as tag
 			# and custom field updates.
 			if tail.model is None:
-				tail.instance = tail.sender.objects.get(pk=tail.instance.pk)
-				tail.model    = self.serialize(tail.sender, tail.instance)
+				tail.model = self.serialize(tail.sender, tail.instance)
 
 			# Prevent dictdiffer from trying to recurse infinitely.
 			if 'tags' in tail.model:
@@ -189,10 +188,11 @@ class KafkaChangeMiddleware:
 			return None
 
 		# The request is required for URLs to be rendered correctly.
+		context  = {'request': _thread_locals.request}
+		instance = sender.objects.get(pk=instance.pk)
+
 		serializer = get_serializer_for_model(instance, prefix)
-		serialized = serializer(instance, context={
-			'request': _thread_locals.request
-		})
+		serialized = serializer(instance, context=context)
 
 		return serialized.data
 
