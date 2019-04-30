@@ -57,6 +57,7 @@ class KafkaChangeMiddleware:
 			'extras.models.CustomFieldValue',
 			'extras.models.ObjectChange',
 			'taggit',
+			'users.models.Token',
 		]))
 
 	def __call__(self, request):
