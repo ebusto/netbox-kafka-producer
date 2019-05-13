@@ -165,6 +165,12 @@ class KafkaChangeMiddleware:
 		if any(map(lambda pattern: pattern.match(name), self.ignore)):
 			return
 
+		# Ignore unserializable models.
+		try:
+			get_serializer_for_model(instance)
+		except:
+			return
+
 		record = Record(event, sender, instance)
 		stream = _thread_locals.streams[id(instance)]
 
