@@ -1,6 +1,7 @@
 import collections
 import confluent_kafka
 import dictdiffer
+import functools
 import re
 import socket
 import time
@@ -12,6 +13,32 @@ from django.db.models        import signals
 from django.utils.functional import curry
 
 from utilities.api import get_serializer_for_model
+
+def serialize(request, sender, instance, prefix=''):
+	# A new record that has not been written to the database.
+	if not instance.pk:
+		return None
+
+	# The request is required for URLs to be rendered correctly.
+	instance = sender.objects.get(pk=instance.pk)
+
+	serializef = serializer(sender, prefix)
+	serialized = serializef(instance, context={'request': request})
+
+	model = serialized.data
+
+	# Prevent dictdiffer from trying to recurse infinitely.
+	if 'tags' in model:
+		model['tags'] = list(model['tags'])
+
+	return model
+
+@functools.lru_cache(maxsize=None)
+def serializer(sender, prefix=''):
+	try:
+		return get_serializer_for_model(sender, prefix)
+	except:
+		return None
 
 def signal_post_delete(record, sender, instance, **kwargs):
 	record('delete', sender, instance)
@@ -29,8 +56,7 @@ def signal_pre_save(record, sender, instance, **kwargs):
 
 	record(events[bool(instance.pk)], sender, instance)
 
-# Record is a simple container class for bundling signal information. The model
-# is the serialized (dict) version of the instance, generated when required.
+# Event is a simple container class for bundling signal information.
 class Event:
 	def __init__(self, event, sender, instance, model=None):
 		self.event    = event
@@ -38,25 +64,17 @@ class Event:
 		self.instance = instance
 		self.model    = model
 
+# Transaction is a class for storing a request, and the stream of events that
+# occurred during that request.
 class Transaction:
-	def __init__(self, ignore, request):
-		self.ignore  = ignore
+	def __init__(self, request):
 		self.request = request
 		self.streams = collections.defaultdict(list)
 
 	# Event is create, update, or delete, as determined by the signal handler.
 	def record(self, event, sender, instance):
-		# Ignore sender?
-		sender_class = sender.__module__ + '.' + sender.__qualname__
-
-		for pattern in self.ignore:
-			if pattern.match(sender_class):
-				return
-
 		# Ignore unserializable models.
-		try:
-			get_serializer_for_model(instance)
-		except:
+		if not serializer(sender):
 			return
 
 		model  = None
@@ -65,33 +83,13 @@ class Transaction:
 		# The first instance must be serialized before related records are
 		# updated.
 		if len(stream) == 0:
-			model = self.serialize(sender, instance)
+			model = serialize(self.request, sender, instance)
 
 		# Store only the first and last events for each instance.
 		if len(stream) == 2:
 			stream.pop()
 
 		stream.append(Event(event, sender, instance, model))
-
-	def serialize(self, sender, instance, prefix=''):
-		# A new record that has not been written to the database.
-		if not instance.pk:
-			return None
-
-		# The request is required for URLs to be rendered correctly.
-		context  = {'request': self.request}
-		instance = sender.objects.get(pk=instance.pk)
-
-		serializer = get_serializer_for_model(instance, prefix)
-		serialized = serializer(instance, context=context)
-
-		model = serialized.data
-
-		# Prevent dictdiffer from trying to recurse infinitely.
-		if 'tags' in model:
-			model['tags'] = list(model['tags'])
-
-		return model
 
 # Tracking changes is accomplished by observing signals emitted for models
 # created, updated, or deleted during a request. In order to determine the
@@ -120,7 +118,7 @@ class KafkaChangeMiddleware:
 		]))
 
 	def __call__(self, request):
-		tx = Transaction(self.ignore, request)
+		tx = Transaction(request)
 		cb = lambda fn: curry(fn, tx.record)
 
 		connections = [
@@ -139,51 +137,63 @@ class KafkaChangeMiddleware:
 		for signal, receiver in connections:
 			signal.disconnect(receiver)
 
-		# streams = {
-		#   id(instance): [Record, Record, ...]
-		# }
 		for stream in tx.streams.values():
-			# Ignore failed requests, where a 'post_*' signal was not received.
-			if len(stream) != 2:
-				continue
+			message = self.process(stream, request)
 
-			head, tail = stream
+			if message:
+				messages.append(message)
 
-			data = {
-				'create': tail,
-				'update': tail,
-				'delete': head, # Publish the model prior to deletion.
-			}[head.event]
+		if messages:
+			self.publish(messages, self.common(request))
 
-			# Loading and serializing the last instance is deferred to as late
-			# as possible, in order to capture all related changes, such as tag
-			# and custom field updates.
-			if data.model is None:
-				data.model = tx.serialize(data.sender, data.instance)
+		return response
 
-			message = collections.defaultdict(dict, {
-				'class': data.sender.__name__,
-				'event': data.event,
-				'model': data.model,
-			})
+	def process(self, stream, request):
+		# Ignore failed requests, where a 'post_*' signal was not received.
+		if len(stream) != 2:
+			return
 
-			messages.append(message)
+		head, tail = stream
 
-			# In order for the consumer to easily build a pynetbox record,
-			# include the absolute URL.
-			if data.event != 'delete':
-				try:
-					nested = tx.serialize(data.sender, data.instance, 'Nested')
+		# Publish the most recent instance, except when the record was deleted.
+		data = {
+			'create': tail,
+			'update': tail,
+			'delete': head,
+		}[head.event]
 
-					if nested and 'url' in nested:
-						message['@url'] = nested['url']
-				except:
-					pass
+		# Ignore sender?
+		sender = data.sender.__module__ + '.' + data.sender.__qualname__
 
-			# No need to find differences unless an existing model was updated.
-			if data.event != 'update':
-				continue
+		for pattern in self.ignore:
+			if pattern.match(sender):
+				return
 
+		# Loading and serializing the last instance is deferred to as late as
+		# possible, in order to capture all related changes, such as tag and
+		# custom field updates.
+		if data.model is None:
+			data.model = serialize(request, data.sender, data.instance)
+
+		message = collections.defaultdict(dict, {
+			'class': data.sender.__name__,
+			'event': data.event,
+			'model': data.model,
+		})
+
+		# In order for the consumer to easily build a pynetbox record, include
+		# the absolute URL.
+		if data.event != 'delete':
+			try:
+				nested = serialize(request, data.sender, data.instance, 'Nested')
+
+				if nested and 'url' in nested:
+					message['@url'] = nested['url']
+			except:
+				pass
+
+		# Find differences between the first and last models.
+		if data.event == 'update':
 			for change in dictdiffer.diff(head.model, tail.model, expand=True):
 				field = change[1]
 
@@ -198,10 +208,7 @@ class KafkaChangeMiddleware:
 					]
 				})
 
-		if messages:
-			self.publish(messages, self.common(request))
-
-		return response
+		return message
 
 	# Common metadata from the request, to be included with each message.
 	def common(self, request):
