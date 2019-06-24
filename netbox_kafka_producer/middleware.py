@@ -19,9 +19,13 @@ def serialize(request, sender, instance, prefix=''):
 	if not instance.pk:
 		return None
 
-	# The request is required for URLs to be rendered correctly.
-	instance = sender.objects.get(pk=instance.pk)
+	# Prefer the current record in the database.
+	queryset = sender.objects.filter(pk=instance.pk)
 
+	if queryset.exists():
+		instance = queryset.get()
+
+	# The request is required for URLs to be rendered correctly.
 	serializef = serializer(sender, prefix)
 	serialized = serializef(instance, context={'request': request})
 
