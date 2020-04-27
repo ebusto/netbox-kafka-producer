@@ -10,7 +10,6 @@ import uuid
 from django.conf             import settings
 from django.core.serializers import json
 from django.db.models        import signals
-from django.utils.functional import curry
 
 from utilities.api import get_serializer_for_model
 
@@ -123,7 +122,7 @@ class KafkaChangeMiddleware:
 
 	def __call__(self, request):
 		tx = Transaction(request)
-		cb = lambda fn: curry(fn, tx.record)
+		cb = lambda fn: functools.partial(fn, tx.record)
 
 		connections = [
 			( signals.post_delete, cb(signal_post_delete) ),
