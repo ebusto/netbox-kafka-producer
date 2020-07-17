@@ -98,18 +98,17 @@ class Transaction:
 # created, updated, or deleted during a request. In order to determine the
 # difference between two models, the first and last instance are stored in
 # the per-instance "stream", partitioned by id(instance).
+producer = confluent_kafka.Producer({
+	'bootstrap.servers':       settings.KAFKA['SERVERS'],
+	'socket.keepalive.enable': True,
+})
+
 class KafkaChangeMiddleware:
 	def __init__(self, get_response):
 		self.get_response = get_response
 
 		self.encoder = json.DjangoJSONEncoder()
-		self.servers = settings.KAFKA['SERVERS']
 		self.topic   = settings.KAFKA['TOPIC']
-
-		self.producer = confluent_kafka.Producer({
-			'bootstrap.servers':       self.servers,
-			'socket.keepalive.enable': True,
-		})
 
 		# Ignore senders that provide duplicate or uninteresting information.
 		self.ignore = list(map(lambda pattern: re.compile(pattern), [
@@ -121,6 +120,10 @@ class KafkaChangeMiddleware:
 		]))
 
 	def __call__(self, request):
+		# GET requests will not result in changes.
+		if request.method == 'GET':
+			return self.get_response(request)
+
 		tx = Transaction(request)
 		cb = lambda fn: functools.partial(fn, tx.record)
 
@@ -241,6 +244,6 @@ class KafkaChangeMiddleware:
 		for message in messages:
 			message.update(common)
 
-			self.producer.produce(self.topic, self.encoder.encode(message))
+			producer.produce(self.topic, self.encoder.encode(message))
 
-		self.producer.flush()
+		producer.flush()
