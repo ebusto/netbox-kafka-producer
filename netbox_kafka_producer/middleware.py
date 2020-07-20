@@ -94,15 +94,17 @@ class Transaction:
 
 		stream.append(Event(event, sender, instance, model))
 
+
+producer = confluent_kafka.Producer({
+	'bootstrap.servers':       settings.KAFKA['SERVERS'],
+	'queue.buffering.max.ms':  250,
+	'socket.keepalive.enable': True,
+})
+
 # Tracking changes is accomplished by observing signals emitted for models
 # created, updated, or deleted during a request. In order to determine the
 # difference between two models, the first and last instance are stored in
 # the per-instance "stream", partitioned by id(instance).
-producer = confluent_kafka.Producer({
-	'bootstrap.servers':       settings.KAFKA['SERVERS'],
-	'socket.keepalive.enable': True,
-})
-
 class KafkaChangeMiddleware:
 	def __init__(self, get_response):
 		self.get_response = get_response
