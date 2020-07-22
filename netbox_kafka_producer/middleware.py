@@ -1,7 +1,5 @@
-import collections
 import confluent_kafka
 import dictdiffer
-import functools
 import re
 import socket
 import time
@@ -10,116 +8,100 @@ import uuid
 from django.conf             import settings
 from django.core.serializers import json
 from django.db.models        import signals
+from utilities.api           import get_serializer_for_model
 
-from utilities.api import get_serializer_for_model
+# Ignore senders that provide duplicate or sensitive information.
+IGNORE = re.compile(
+	'|'.join([
+		'django.contrib',
+		'extras.models.ObjectChange',
+		'extras.models.customfields.CustomFieldValue',
+		'extras.models.tags.TaggedItem',
+		'netbox_rbac.models.Profile',
+		'users.models.Token',
+	])
+)
 
-def serialize(request, sender, instance, prefix=''):
-	# A new record that has not been written to the database.
-	if not instance.pk:
-		return None
+# Change describe a per-instance change. The "model" is the serialized instance
+# prior to any updates. The "instance" is the last (unserialized) instance.
+class Change:
+	def __init__(self, event, model):
+		self.event = event
+		self.model = model
 
-	# Prefer the current record in the database.
-	queryset = sender.objects.filter(pk=instance.pk)
+		self.complete = None
+		self.instance = None
 
-	if queryset.exists():
-		instance = queryset.get()
-
-	# The request is required for URLs to be rendered correctly.
-	serializef = serializer(sender, prefix)
-	serialized = serializef(instance, context={'request': request})
-
-	model = serialized.data
-
-	# Prevent dictdiffer from trying to recurse infinitely.
-	if 'tags' in model:
-		model['tags'] = list(model['tags'])
-
-	return model
-
-@functools.lru_cache(maxsize=None)
-def serializer(sender, prefix=''):
-	try:
-		return get_serializer_for_model(sender, prefix)
-	except:
-		return None
-
-def signal_post_delete(record, sender, instance, **kwargs):
-	record('delete', sender, instance)
-
-def signal_post_save(record, sender, instance, created, **kwargs):
-	events = {True: 'create', False: 'update'}
-
-	record(events[created], sender, instance)
-
-def signal_pre_delete(record, sender, instance, **kwargs):
-	record('delete', sender, instance)
-
-def signal_pre_save(record, sender, instance, **kwargs):
-	events = {True: 'update', False: 'create'}
-
-	record(events[bool(instance.pk)], sender, instance)
-
-# Event is a simple container class for bundling signal information.
-class Event:
-	def __init__(self, event, sender, instance, model=None):
-		self.event    = event
-		self.sender   = sender
-		self.instance = instance
-		self.model    = model
-
-# Transaction is a class for storing a request, and the stream of events that
-# occurred during that request.
+# Transaction stores a request and the changes that occurred.
 class Transaction:
 	def __init__(self, request):
 		self.request = request
-		self.streams = collections.defaultdict(list)
+		self.changes = dict()
 
-	# Event is create, update, or delete, as determined by the signal handler.
-	def record(self, event, sender, instance):
-		# Ignore unserializable models.
-		if not serializer(sender):
-			return
+	def change(self, instance, event):
+		if not self.ignore(instance):
+			self.changes[id(instance)] = Change(event, self.serialize(instance))
 
-		model  = None
-		stream = self.streams[id(instance)]
+	def commit(self, instance):
+		if not self.ignore(instance):
+			change = self.changes[id(instance)]
 
-		# The first instance must be serialized before related records are
-		# updated.
-		if len(stream) == 0:
-			model = serialize(self.request, sender, instance)
+			change.complete = True
+			change.instance = instance
 
-		# Store only the first and last events for each instance.
-		if len(stream) == 2:
-			stream.pop()
+	def ignore(self, instance):
+		return IGNORE.match(
+			instance.__class__.__module__ + '.' + \
+			instance.__class__.__qualname__
+		)
 
-		stream.append(Event(event, sender, instance, model))
+	def serialize(self, instance, prefix=''):
+		if not instance.pk:
+			return None
 
+		sender = instance.__class__
+		record = sender.objects.get(pk=instance.pk)
 
-producer = confluent_kafka.Producer({
-	'bootstrap.servers':       settings.KAFKA['SERVERS'],
-	'queue.buffering.max.ms':  250,
-	'socket.keepalive.enable': True,
-})
+		try:
+			fn = get_serializer_for_model(record, prefix)
+
+			model = fn(record, context={'request': self.request})
+			model = model.data
+
+			# Prevent dictdiffer from trying to recurse infinitely.
+			if 'tags' in model:
+				model['tags'] = list(model['tags'])
+
+			return model
+		except:
+			return None
+
+	def signal_pre_delete(self, instance, **kwargs):
+		self.change(instance, 'delete')
+
+	def signal_pre_save(self, instance, **kwargs):
+		self.change(instance, 'update' if instance.pk else 'create')
+
+	def signal_post_delete(self, instance, **kwargs):
+		self.commit(instance)
+
+	def signal_post_save(self, instance, **kwargs):
+		self.commit(instance)
 
 # Tracking changes is accomplished by observing signals emitted for models
-# created, updated, or deleted during a request. In order to determine the
-# difference between two models, the first and last instance are stored in
-# the per-instance "stream", partitioned by id(instance).
+# created, updated, or deleted during a request.
 class KafkaChangeMiddleware:
 	def __init__(self, get_response):
 		self.get_response = get_response
 
 		self.encoder = json.DjangoJSONEncoder()
+		self.servers = settings.KAFKA['SERVERS']
 		self.topic   = settings.KAFKA['TOPIC']
 
-		# Ignore senders that provide duplicate or uninteresting information.
-		self.ignore = list(map(lambda pattern: re.compile(pattern), [
-			'django.contrib',
-			'extras.models.CustomFieldValue',
-			'extras.models.ObjectChange',
-			'taggit',
-			'users.models.Token',
-		]))
+		self.producer = confluent_kafka.Producer({
+			'bootstrap.servers':       self.servers,
+			'socket.keepalive.enable': True,
+		})
 
 	def __call__(self, request):
 		# GET requests will not result in changes.
@@ -127,96 +109,34 @@ class KafkaChangeMiddleware:
 			return self.get_response(request)
 
 		tx = Transaction(request)
-		cb = lambda fn: functools.partial(fn, tx.record)
 
 		connections = [
-			( signals.post_delete, cb(signal_post_delete) ),
-			( signals.post_save,   cb(signal_post_save)   ),
-			( signals.pre_delete,  cb(signal_pre_delete)  ),
-			( signals.pre_save,    cb(signal_pre_save)    ),
+			( signals.post_delete, tx.signal_post_delete ),
+			( signals.post_save,   tx.signal_post_save   ),
+			( signals.pre_delete,  tx.signal_pre_delete  ),
+			( signals.pre_save,    tx.signal_pre_save    ),
 		]
 
 		for signal, receiver in connections:
 			signal.connect(receiver)
 
-		messages = []
 		response = self.get_response(request)
 
 		for signal, receiver in connections:
 			signal.disconnect(receiver)
 
-		for stream in tx.streams.values():
-			message = self.process(stream, request)
+		common = self.common(request)
 
-			if message:
-				messages.append(message)
+		for _, change in tx.changes.items():
+			if change.complete:
+				message = self.message(tx, change)
+				message.update(common)
 
-		if messages:
-			self.publish(messages, self.common(request))
+				self.producer.produce(self.topic, self.encoder.encode(message))
+
+		self.producer.flush()
 
 		return response
-
-	def process(self, stream, request):
-		# Ignore failed requests, where a 'post_*' signal was not received.
-		if len(stream) != 2:
-			return
-
-		head, tail = stream
-
-		# Publish the most recent instance, except when the record was deleted.
-		data = {
-			'create': tail,
-			'update': tail,
-			'delete': head,
-		}[head.event]
-
-		# Ignore sender?
-		sender = data.sender.__module__ + '.' + data.sender.__qualname__
-
-		for pattern in self.ignore:
-			if pattern.match(sender):
-				return
-
-		# Loading and serializing the last instance is deferred to as late as
-		# possible, in order to capture all related changes, such as tag and
-		# custom field updates.
-		if data.model is None:
-			data.model = serialize(request, data.sender, data.instance)
-
-		message = collections.defaultdict(dict, {
-			'class': data.sender.__name__,
-			'event': data.event,
-			'model': data.model,
-		})
-
-		# In order for the consumer to easily build a pynetbox record, include
-		# the absolute URL.
-		if data.event != 'delete':
-			try:
-				nested = serialize(request, data.sender, data.instance, 'Nested')
-
-				if nested and 'url' in nested:
-					message['@url'] = nested['url']
-			except:
-				pass
-
-		# Find differences between the first and last models.
-		if data.event == 'update':
-			for change in dictdiffer.diff(head.model, tail.model, expand=True):
-				field = change[1]
-
-				# Array change.
-				if isinstance(field, list):
-					field = field[0]
-
-				message['detail'].update({
-					field: [
-						dictdiffer.dot_lookup(head.model, field),
-						dictdiffer.dot_lookup(tail.model, field),
-					]
-				})
-
-		return message
 
 	# Common metadata from the request, to be included with each message.
 	def common(self, request):
@@ -242,10 +162,47 @@ class KafkaChangeMiddleware:
 			},
 		}
 
-	def publish(self, messages, common):
-		for message in messages:
-			message.update(common)
+	# Returns the difference between two models.
+	def diff(self, a, b):
+		detail = {}
 
-			producer.produce(self.topic, self.encoder.encode(message))
+		for diff in dictdiffer.diff(a, b, expand=True):
+			field = diff[1]
 
-		producer.flush()
+			# Array change.
+			if isinstance(field, list):
+				field = field[0]
+
+			detail[field] = [
+				dictdiffer.dot_lookup(a, field),
+				dictdiffer.dot_lookup(b, field),
+			]
+
+		return detail
+
+	# Returns the message to be published for the change.
+	def message(self, tx, change):
+		# Track the initial model for diffing.
+		initial = None
+
+		if change.event != 'delete':
+			initial, change.model = change.model, tx.serialize(change.instance)
+
+		message = {
+			'class': change.instance.__class__.__name__,
+			'event': change.event,
+			'model': change.model,
+		}
+
+		# In order for the consumer to easily build a pynetbox record, include
+		# the absolute URL.
+		if change.event != 'delete':
+			nested = tx.serialize(change.instance, 'Nested')
+
+			if nested and 'url' in nested:
+				message['@url'] = nested['url']
+
+		if change.event == 'update':
+			message['detail'] = self.diff(initial, change.model)
+
+		return message
