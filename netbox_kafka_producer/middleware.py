@@ -18,7 +18,7 @@ IGNORE = re.compile(
 		'extras.models.customfields.CustomFieldValue',
 		'extras.models.tags.TaggedItem',
 		'netbox_rbac.models.Profile',
-		'users.models.Token',
+		'users.models',
 	])
 )
 
