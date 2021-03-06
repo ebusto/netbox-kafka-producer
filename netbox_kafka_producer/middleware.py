@@ -10,6 +10,7 @@ from django.core.serializers import json
 from django.db.models        import signals
 from utilities.api           import get_serializer_for_model
 
+
 # Ignore senders that provide duplicate or sensitive information.
 IGNORE = re.compile(
     '|'.join([
@@ -135,9 +136,11 @@ class KafkaChangeMiddleware:
         for _, change in tx.changes.items():
             if change.complete:
                 message = self.message(tx, change)
-                message.update(common)
 
-                self.producer.produce(self.topic, self.encoder.encode(message))
+                if message:
+                    message.update(common)
+
+                    self.producer.produce(self.topic, self.encoder.encode(message))
 
         self.producer.flush()
 
@@ -208,6 +211,11 @@ class KafkaChangeMiddleware:
                 message['@url'] = nested['url']
 
         if change.event == 'update':
-            message['detail'] = self.diff(initial, change.model)
+            detail = self.diff(initial, change.model)
+
+            if not detail:
+                return None
+
+            message['detail'] = detail
 
         return message
