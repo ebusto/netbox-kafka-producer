@@ -8,7 +8,7 @@ with open('requirements.txt', 'r') as fh:
 
 setuptools.setup(
 	name='netbox-kafka-producer',
-	version='1.0.18',
+	version='1.0.19',
 	author='Eric Busto',
 	author_email='ebusto@nvidia.com',
 	description='Easily publish NetBox changes to Kafka',
