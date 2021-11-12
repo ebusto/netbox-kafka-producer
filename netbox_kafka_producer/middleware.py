@@ -3,7 +3,6 @@ import dictdiffer
 import re
 import socket
 import time
-import uuid
 
 from django.conf             import settings
 from django.core.serializers import json
@@ -15,8 +14,8 @@ from utilities.api           import get_serializer_for_model
 IGNORE = re.compile(
     '|'.join([
         'django.contrib',
-        'extras.models.ObjectChange',
-        'extras.models.customfields.CustomFieldValue',
+        'extras.models.change_logging',
+        'extras.models.customfields',
         'extras.models.tags.TaggedItem',
         'netbox_rbac.models.Profile',
         'users.models',
@@ -163,7 +162,7 @@ class KafkaChangeMiddleware:
             'request': {
                 'addr': addr,
                 'user': user,
-                'uuid': uuid.uuid4().hex,
+                'uuid': request.id,
             },
             'response': {
                 'host': socket.gethostname(),
