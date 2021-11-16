@@ -105,6 +105,7 @@ class KafkaChangeMiddleware:
 
         self.producer = confluent_kafka.Producer({
             'bootstrap.servers':       self.servers,
+            'request.required.acks':   1,
             'socket.keepalive.enable': True,
         })
 
