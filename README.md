@@ -1,6 +1,8 @@
 # Introduction
 This module provides middleware to publish [NetBox](https://github.com/digitalocean/netbox/) changes to [Kafka](https://kafka.apache.org/).
 
+This module is currently unmaintained. Use at your own risk.
+
 # Installation
 `pip install netbox-kafka-producer`
 
